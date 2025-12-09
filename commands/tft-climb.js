@@ -159,23 +159,11 @@ module.exports = {
             }
 
             // Analyze matches and track LP changes
-            const climbData = [];
+            const matchHistory = []; // Store all matches first
             const duoPartners = new Map();
-            let currentLP = calculateTotalLP(currentRank.tier, currentRank.rank, currentRank.leaguePoints);
             
-            // Start from current and work backwards
-            climbData.unshift({
-                gameNumber: 0,
-                totalLP: currentLP,
-                tier: currentRank.tier,
-                rank: currentRank.rank,
-                lp: currentRank.leaguePoints,
-                placement: null,
-                partner: null
-            });
-
-            let doubleUpCount = 0;
-            let processedGames = 0;
+            // Set 16 launch date (December 3rd, 2025)
+            const set16LaunchDate = new Date('2025-12-03T00:00:00Z').getTime();
 
             for (let i = 0; i < matchIds.length; i++) {
                 const matchId = matchIds[i];
@@ -189,18 +177,21 @@ module.exports = {
                     
                     const match = await matchRes.json();
                     
+                    // Skip games from before Set 16 launch (rank reset)
+                    if (match.info.game_datetime < set16LaunchDate) {
+                        continue;
+                    }
+                    
                     // Only process Double Up games
                     if (match.info.tft_game_type !== 'pairs') continue;
                     
                     const playerData = match.info.participants.find(p => p.puuid === summoner.puuid);
                     if (!playerData) continue;
 
-                    doubleUpCount++;
-                    processedGames++;
-
-                    // Find duo partner (same placement in Double Up)
+                    // Find duo partner using Double Up placement logic
+                    const teamPlacement = Math.ceil(playerData.placement / 2);
                     const partner = match.info.participants.find(
-                        p => p.puuid !== summoner.puuid && p.placement === playerData.placement
+                        p => p.puuid !== summoner.puuid && Math.ceil(p.placement / 2) === teamPlacement
                     );
 
                     if (partner) {
@@ -236,36 +227,24 @@ module.exports = {
                         }
                     }
 
-                    // Estimate LP change based on placement (Double Up uses team placement)
-                    const teamPlacement = Math.ceil(playerData.placement / 2);
+                    // Store match data
                     let lpChange = 0;
                     
-                    if (teamPlacement === 1) lpChange = -35;
-                    else if (teamPlacement === 2) lpChange = -25;
-                    else if (teamPlacement === 3) lpChange = -15;
-                    else if (teamPlacement === 4) lpChange = -10;
-                    else if (teamPlacement === 5) lpChange = 10;
-                    else if (teamPlacement === 6) lpChange = 15;
-                    else if (teamPlacement === 7) lpChange = 25;
-                    else if (teamPlacement === 8) lpChange = 35;
+                    if (teamPlacement === 1) lpChange = 35;
+                    else if (teamPlacement === 2) lpChange = 25;
+                    else if (teamPlacement === 3) lpChange = 15;
+                    else if (teamPlacement === 4) lpChange = 10;
+                    else if (teamPlacement === 5) lpChange = -10;
+                    else if (teamPlacement === 6) lpChange = -15;
+                    else if (teamPlacement === 7) lpChange = -25;
+                    else if (teamPlacement === 8) lpChange = -35;
 
-                    // Calculate previous LP
-                    const previousLP = currentLP - lpChange;
-                    const rankInfo = getTierFromTotalLP(previousLP);
-
-                    climbData.unshift({
-                        gameNumber: processedGames,
-                        totalLP: previousLP,
-                        tier: rankInfo.tier,
-                        rank: rankInfo.rank,
-                        lp: rankInfo.lp,
-                        placement: teamPlacement,
+                    matchHistory.push({
+                        timestamp: match.info.game_datetime,
+                        teamPlacement: teamPlacement,
                         lpChange: lpChange,
-                        partner: partner ? partner.puuid : null,
-                        timestamp: match.info.game_datetime
+                        partner: partner ? partner.puuid : null
                     });
-
-                    currentLP = previousLP;
 
                     // Small delay to avoid rate limiting
                     await new Promise(resolve => setTimeout(resolve, 50));
@@ -276,16 +255,56 @@ module.exports = {
                 }
             }
 
-            if (doubleUpCount === 0) {
-                await interaction.editReply('❌ No Double Up matches found in recent history.');
+            if (matchHistory.length === 0) {
+                await interaction.editReply('❌ No Double Up matches found since December 3rd, 2025.');
                 return;
             }
 
-            // Reverse to show chronological order
-            climbData.reverse();
-            for (let i = 0; i < climbData.length; i++) {
-                climbData[i].gameNumber = i;
+            // Sort by timestamp (oldest first)
+            matchHistory.sort((a, b) => a.timestamp - b.timestamp);
+
+            // Now build climb data going FORWARD from first game
+            const climbData = [];
+            const currentTotalLP = calculateTotalLP(currentRank.tier, currentRank.rank, currentRank.leaguePoints);
+            
+            // Calculate total LP change from all games
+            const totalLPChange = matchHistory.reduce((sum, match) => sum + match.lpChange, 0);
+            
+            // Starting LP = Current LP - Total LP Change
+            let trackingLP = currentTotalLP - totalLPChange;
+            const startRankInfo = getTierFromTotalLP(trackingLP);
+            
+            // Add starting point
+            climbData.push({
+                gameNumber: 0,
+                totalLP: trackingLP,
+                tier: startRankInfo.tier,
+                rank: startRankInfo.rank,
+                lp: startRankInfo.lp,
+                placement: null,
+                partner: null
+            });
+
+            // Now go through each match in chronological order
+            for (let i = 0; i < matchHistory.length; i++) {
+                const match = matchHistory[i];
+                trackingLP += match.lpChange;
+                const rankInfo = getTierFromTotalLP(trackingLP);
+                
+                climbData.push({
+                    gameNumber: i + 1,
+                    totalLP: trackingLP,
+                    tier: rankInfo.tier,
+                    rank: rankInfo.rank,
+                    lp: rankInfo.lp,
+                    placement: match.teamPlacement,
+                    lpChange: match.lpChange,
+                    partner: match.partner,
+                    timestamp: match.timestamp
+                });
             }
+
+            const doubleUpCount = matchHistory.length;
 
             // Generate graph
             const canvas = await generateClimbGraph(climbData, summoner, duoPartners);
@@ -294,12 +313,17 @@ module.exports = {
             // Calculate statistics
             const startLP = climbData[0].totalLP;
             const endLP = climbData[climbData.length - 1].totalLP;
-            const totalLPGain = endLP - startLP;
-            const avgLPPerGame = (totalLPGain / (climbData.length - 1)).toFixed(1);
+            const netLPGain = endLP - startLP;
+            const avgLPPerGame = doubleUpCount > 0 ? (netLPGain / doubleUpCount).toFixed(1) : '0.0';
 
-            const wins = climbData.filter(d => d.placement && d.placement <= 2).length;
-            const losses = climbData.filter(d => d.placement && d.placement >= 5).length;
-            const winRate = climbData.length > 1 ? ((wins / (climbData.length - 1)) * 100).toFixed(1) : '0.0';
+            // Calculate placement statistics (Double Up style)
+            const firsts = matchHistory.filter(d => d.teamPlacement === 1).length;
+            const seconds = matchHistory.filter(d => d.teamPlacement === 2).length;
+            const thirds = matchHistory.filter(d => d.teamPlacement === 3).length;
+            const fourths = matchHistory.filter(d => d.teamPlacement === 4).length;
+            
+            const top2Count = firsts + seconds; // Win in Double Up
+            const top2Rate = doubleUpCount > 0 ? ((top2Count / doubleUpCount) * 100).toFixed(1) : '0.0';
 
             // Get top duo partners
             const topPartners = Array.from(duoPartners.entries())
@@ -312,7 +336,7 @@ module.exports = {
             const endRankDisplay = `${currentRank.tier} ${currentRank.rank} - ${currentRank.leaguePoints} LP`;
 
             const embed = new EmbedBuilder()
-                .setColor(totalLPGain >= 0 ? '#00FF00' : '#FF0000')
+                .setColor(netLPGain >= 0 ? '#00FF00' : '#FF0000')
                 .setAuthor({ 
                     name: `${summoner.gameName}#${summoner.tagLine}`,
                     iconURL: `http://ddragon.leagueoflegends.com/cdn/15.24.1/img/profileicon/${summoner.profileIconId}.png`
@@ -321,13 +345,18 @@ module.exports = {
                 .setDescription(
                     `**Starting Rank:** ${startRankDisplay}\n` +
                     `**Current Rank:** ${endRankDisplay}\n` +
-                    `**Net LP Change:** ${totalLPGain >= 0 ? '+' : ''}${totalLPGain} LP`
+                    `**Net LP Change:** ${netLPGain >= 0 ? '+' : ''}${netLPGain} LP`
                 )
                 .addFields(
                     { 
-                        name: '📊 Statistics', 
-                        value: `Wins: ${wins}\nLosses: ${losses}\nWin Rate: ${winRate}%\nAvg LP/Game: ${avgLPPerGame >= 0 ? '+' : ''}${avgLPPerGame}`,
+                        name: '📊 Placements', 
+                        value: `1sts: ${firsts}\n2nds: ${seconds}\n3rds: ${thirds}\n4ths: ${fourths}\nTop 2 Rate: ${top2Rate}%`,
                         inline: true 
+                    },
+                    { 
+                        name: '📈 Performance',
+                        value: `Avg LP/Game: ${avgLPPerGame >= 0 ? '+' : ''}${avgLPPerGame}\nTotal Games: ${doubleUpCount}`,
+                        inline: true
                     },
                     { 
                         name: '👥 Top Duo Partners', 
@@ -337,7 +366,7 @@ module.exports = {
                 )
                 .setImage('attachment://climb.png')
                 .setTimestamp()
-                .setFooter({ text: `Analyzing ${doubleUpCount} Double Up matches` });
+                .setFooter({ text: `Analyzing ${doubleUpCount} Double Up matches since Dec 3, 2025` });
 
             await interaction.editReply({ embeds: [embed], files: [attachment] });
 
@@ -349,8 +378,8 @@ module.exports = {
 };
 
 async function generateClimbGraph(climbData, summoner, duoPartners) {
-    const width = 1400;
-    const height = 800;
+    const width = 1600;
+    const height = 900;
     const canvas = Canvas.createCanvas(width, height);
     const ctx = canvas.getContext('2d');
 
@@ -366,16 +395,22 @@ async function generateClimbGraph(climbData, summoner, duoPartners) {
         ctx.fillRect(0, 0, width, height);
     }
 
-    // Graph area
-    const padding = { top: 80, right: 150, bottom: 100, left: 100 };
+    // Graph area with more space for legend
+    const padding = { top: 80, right: 250, bottom: 100, left: 100 };
     const graphWidth = width - padding.left - padding.right;
     const graphHeight = height - padding.top - padding.bottom;
 
-    // Calculate min/max LP for scaling
+    // Calculate min/max LP for scaling - add padding for better view
     const lpValues = climbData.map(d => d.totalLP);
     const minLP = Math.min(...lpValues);
     const maxLP = Math.max(...lpValues);
     const lpRange = maxLP - minLP || 100;
+    
+    // Add 10% padding to top and bottom for better visualization
+    const lpPadding = lpRange * 0.1;
+    const displayMinLP = minLP - lpPadding;
+    const displayMaxLP = maxLP + lpPadding;
+    const displayRange = displayMaxLP - displayMinLP;
 
     // Draw grid lines and labels
     ctx.strokeStyle = 'rgba(255, 255, 255, 0.1)';
@@ -387,7 +422,7 @@ async function generateClimbGraph(climbData, summoner, duoPartners) {
     const gridLines = 8;
     for (let i = 0; i <= gridLines; i++) {
         const y = padding.top + (graphHeight / gridLines) * i;
-        const lpValue = maxLP - (lpRange / gridLines) * i;
+        const lpValue = displayMaxLP - (displayRange / gridLines) * i;
         const rankInfo = getTierFromTotalLP(lpValue);
         
         ctx.beginPath();
@@ -414,7 +449,7 @@ async function generateClimbGraph(climbData, summoner, duoPartners) {
 
     for (let i = 0; i < climbData.length; i++) {
         const x = padding.left + (graphWidth / (climbData.length - 1)) * i;
-        const y = padding.top + graphHeight - ((climbData[i].totalLP - minLP) / lpRange) * graphHeight;
+        const y = padding.top + graphHeight - ((climbData[i].totalLP - displayMinLP) / displayRange) * graphHeight;
 
         if (i === 0) {
             ctx.moveTo(x, y);
@@ -424,17 +459,18 @@ async function generateClimbGraph(climbData, summoner, duoPartners) {
     }
     ctx.stroke();
 
-    // Draw data points with placement colors
+    // Draw data points with placement colors (Double Up: 1-4 instead of 1-8)
     for (let i = 0; i < climbData.length; i++) {
         const data = climbData[i];
         const x = padding.left + (graphWidth / (climbData.length - 1)) * i;
-        const y = padding.top + graphHeight - ((data.totalLP - minLP) / lpRange) * graphHeight;
+        const y = padding.top + graphHeight - ((data.totalLP - displayMinLP) / displayRange) * graphHeight;
 
-        // Color based on placement
+        // Color based on Double Up placement (1-4)
         if (data.placement) {
-            if (data.placement <= 2) ctx.fillStyle = '#00FF00'; // Win (top 2)
-            else if (data.placement <= 4) ctx.fillStyle = '#FFFF00'; // Middle
-            else ctx.fillStyle = '#FF0000'; // Loss (bottom 4)
+            if (data.placement === 1) ctx.fillStyle = '#FFD700'; // 1st - Gold
+            else if (data.placement === 2) ctx.fillStyle = '#00FF00'; // 2nd - Green (still top 2)
+            else if (data.placement === 3) ctx.fillStyle = '#FFFF00'; // 3rd - Yellow
+            else if (data.placement === 4) ctx.fillStyle = '#FF0000'; // 4th - Red
         } else {
             ctx.fillStyle = '#00D4FF'; // Current point
         }
@@ -444,7 +480,7 @@ async function generateClimbGraph(climbData, summoner, duoPartners) {
         ctx.fill();
 
         // Draw partner icon at intervals
-        if (data.partner && duoPartners.has(data.partner) && i % 5 === 0) {
+        if (data.partner && duoPartners.has(data.partner) && i % 3 === 0 && i > 0) {
             const partner = duoPartners.get(data.partner);
             const iconUrl = `http://ddragon.leagueoflegends.com/cdn/15.24.1/img/profileicon/${partner.iconId}.png`;
             const icon = await loadImageWithCache(iconUrl);
@@ -452,17 +488,17 @@ async function generateClimbGraph(climbData, summoner, duoPartners) {
             if (icon) {
                 ctx.save();
                 ctx.beginPath();
-                ctx.arc(x, y - 25, 12, 0, Math.PI * 2);
+                ctx.arc(x, y - 30, 15, 0, Math.PI * 2);
                 ctx.closePath();
                 ctx.clip();
-                ctx.drawImage(icon, x - 12, y - 37, 24, 24);
+                ctx.drawImage(icon, x - 15, y - 45, 30, 30);
                 ctx.restore();
 
                 // Border around icon
                 ctx.strokeStyle = '#FFD700';
                 ctx.lineWidth = 2;
                 ctx.beginPath();
-                ctx.arc(x, y - 25, 12, 0, Math.PI * 2);
+                ctx.arc(x, y - 30, 15, 0, Math.PI * 2);
                 ctx.stroke();
             }
         }
@@ -470,63 +506,127 @@ async function generateClimbGraph(climbData, summoner, duoPartners) {
 
     // Title
     ctx.fillStyle = '#ffffff';
-    ctx.font = 'bold 28px Arial';
+    ctx.font = 'bold 32px Arial';
     ctx.textAlign = 'center';
-    ctx.fillText('Double Up Ranked Climb', width / 2, 40);
+    ctx.fillText('Double Up Ranked Climb', width / 2, 45);
 
     // Legend
-    ctx.font = '16px Arial';
+    ctx.font = '18px Arial';
     ctx.textAlign = 'left';
-    const legendX = width - padding.right + 20;
+    const legendX = width - padding.right + 30;
     let legendY = padding.top;
 
     ctx.fillStyle = '#ffffff';
     ctx.fillText('Placement:', legendX, legendY);
-    legendY += 30;
+    legendY += 35;
 
-    // Win indicator
+    // 1st place indicator
+    ctx.fillStyle = '#FFD700';
+    ctx.beginPath();
+    ctx.arc(legendX + 10, legendY, 6, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.fillStyle = '#ffffff';
+    ctx.fillText('1st Place', legendX + 25, legendY + 5);
+    legendY += 35;
+
+    // 2nd place indicator
     ctx.fillStyle = '#00FF00';
     ctx.beginPath();
     ctx.arc(legendX + 10, legendY, 6, 0, Math.PI * 2);
     ctx.fill();
     ctx.fillStyle = '#ffffff';
-    ctx.fillText('1st-2nd (Top 2)', legendX + 25, legendY + 5);
-    legendY += 30;
+    ctx.fillText('2nd Place', legendX + 25, legendY + 5);
+    legendY += 35;
 
-    // Middle indicator
+    // 3rd place indicator
     ctx.fillStyle = '#FFFF00';
     ctx.beginPath();
     ctx.arc(legendX + 10, legendY, 6, 0, Math.PI * 2);
     ctx.fill();
     ctx.fillStyle = '#ffffff';
-    ctx.fillText('3rd-4th', legendX + 25, legendY + 5);
-    legendY += 30;
+    ctx.fillText('3rd Place', legendX + 25, legendY + 5);
+    legendY += 35;
 
-    // Loss indicator
+    // 4th place indicator
     ctx.fillStyle = '#FF0000';
     ctx.beginPath();
     ctx.arc(legendX + 10, legendY, 6, 0, Math.PI * 2);
     ctx.fill();
     ctx.fillStyle = '#ffffff';
-    ctx.fillText('5th-8th (Bottom 4)', legendX + 25, legendY + 5);
-    legendY += 50;
+    ctx.fillText('4th Place', legendX + 25, legendY + 5);
+    legendY += 55;
 
-    // Partner indicator
+    // Duo Partner section
     ctx.fillStyle = '#ffffff';
-    ctx.fillText('👥 = Duo Partner', legendX, legendY);
+    ctx.font = 'bold 20px Arial';
+    ctx.fillText('Duo Partner', legendX, legendY);
+    legendY += 35;
+
+    // Draw the most common duo partner's icon (if exists)
+    const topPartner = Array.from(duoPartners.entries())
+        .sort((a, b) => b[1].count - a[1].count)[0];
+    
+    if (topPartner) {
+        const [_, partnerData] = topPartner;
+        const partnerIconUrl = `http://ddragon.leagueoflegends.com/cdn/15.24.1/img/profileicon/${partnerData.iconId}.png`;
+        const partnerIcon = await loadImageWithCache(partnerIconUrl);
+        
+        if (partnerIcon) {
+            const iconSize = 50;
+            const iconX = legendX + 75;
+            const iconY = legendY;
+            
+            // Gradient background circle
+            const gradient = ctx.createRadialGradient(iconX, iconY, 0, iconX, iconY, iconSize / 2 + 10);
+            gradient.addColorStop(0, 'rgba(255, 215, 0, 0.3)');
+            gradient.addColorStop(1, 'rgba(255, 215, 0, 0)');
+            ctx.fillStyle = gradient;
+            ctx.beginPath();
+            ctx.arc(iconX, iconY, iconSize / 2 + 10, 0, Math.PI * 2);
+            ctx.fill();
+            
+            // Draw icon with circular clip
+            ctx.save();
+            ctx.beginPath();
+            ctx.arc(iconX, iconY, iconSize / 2, 0, Math.PI * 2);
+            ctx.closePath();
+            ctx.clip();
+            ctx.drawImage(partnerIcon, iconX - iconSize / 2, iconY - iconSize / 2, iconSize, iconSize);
+            ctx.restore();
+            
+            // Gold border
+            ctx.strokeStyle = '#FFD700';
+            ctx.lineWidth = 3;
+            ctx.beginPath();
+            ctx.arc(iconX, iconY, iconSize / 2, 0, Math.PI * 2);
+            ctx.stroke();
+            
+            // Partner name
+            ctx.fillStyle = '#ffffff';
+            ctx.font = '14px Arial';
+            ctx.textAlign = 'center';
+            const partnerName = partnerData.name.split('#')[0]; // Just the name, no tag
+            ctx.fillText(partnerName, iconX, iconY + iconSize / 2 + 20);
+            
+            // Game count
+            ctx.font = '12px Arial';
+            ctx.fillStyle = '#FFD700';
+            ctx.fillText(`${partnerData.count} games`, iconX, iconY + iconSize / 2 + 35);
+        }
+    }
 
     // Display LP gain/loss trend
     const startLP = climbData[0].totalLP;
     const endLP = climbData[climbData.length - 1].totalLP;
     const change = endLP - startLP;
     
-    ctx.font = 'bold 20px Arial';
+    ctx.font = 'bold 24px Arial';
     ctx.textAlign = 'center';
     ctx.fillStyle = change >= 0 ? '#00FF00' : '#FF0000';
     ctx.fillText(
         `${change >= 0 ? '▲' : '▼'} ${Math.abs(change)} LP`,
         width / 2,
-        height - 30
+        height - 35
     );
 
     return canvas;
